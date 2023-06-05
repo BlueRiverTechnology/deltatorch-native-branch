@@ -10,15 +10,14 @@ def create_pytorch_dataloader(
     path: str,
     id_field: str,
     fields: List[FieldSpec],
-    batch_size: int = None,
+    batch_size: int = 32,
     collate_fn: Optional[Callable[[List], Any]] = None,
     use_fixed_rank: bool = False,
     rank: int = None,
     num_ranks: int = None,
     num_workers: int = 2,
     shuffle: bool = False,
-    timeout: int = 15,
-    queue_size: int = 25000,
+    drop_last: bool = False,
 ):
     dataset = IDBasedDeltaDataset(
         path,
@@ -29,14 +28,15 @@ def create_pytorch_dataloader(
         num_ranks,
         num_workers,
         shuffle,
-        timeout,
-        queue_size,
+        batch_size,
+        drop_last,
     )
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         collate_fn=collate_fn,
+        drop_last=drop_last,
     )

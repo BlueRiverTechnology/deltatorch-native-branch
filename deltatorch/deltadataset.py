@@ -5,16 +5,14 @@ import threading
 from abc import abstractmethod, ABC
 from dataclasses import dataclass
 from queue import Queue
-from queue import Empty
+from typing import Optional, Callable, List, Tuple, Dict, Any
 
 import numpy as np
+import pyarrow.dataset as ds
 import torch.distributed
 from PIL import Image
 from deltalake import DeltaTable
 from torch.utils.data import IterableDataset
-import pyarrow.dataset as ds
-import pyarrow.compute as pc
-from typing import Optional, Callable, List, Tuple, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +36,8 @@ class DeltaIterableDataset(IterableDataset):
         num_ranks: int = None,
         num_workers: int = 2,
         shuffle: bool = False,
-        timeout: int = 15,
-        queue_size: int = 25000,
+        batch_size: int = 32,
+        drop_last: bool = False,
     ) -> None:
         super().__init__()
         self.path = path
@@ -50,21 +48,13 @@ class DeltaIterableDataset(IterableDataset):
         self.num_ranks = num_ranks
         self.num_workers = num_workers
         self.shuffle = shuffle
-        self.timeout = timeout
+        self.drop_last = drop_last
         self.path = path
-        self.queue_size = queue_size
-
-        self.queue = Queue(maxsize=queue_size)
-        self.stop_event = threading.Event()
-        self.delta_table = None
-        self.scanner = None
-        self.workers = []
-
-        self.loaded = False
-        self.boundaries_set = False
+        self.batch_size = batch_size
+        self.init_boundaries(path)
 
     @abstractmethod
-    def init_loading(self, path):
+    def process_data(self):
         pass
 
     def init_boundaries(self, path, init_start_end: bool = True):
@@ -74,10 +64,9 @@ class DeltaIterableDataset(IterableDataset):
 
         if self.use_fixed_rank:
             if init_start_end:
-                new_start = self.rank * self.end / self.num_ranks
-                new_end = (self.rank + 1) * self.end / self.num_ranks
-                self.start = new_start
-                self.end = new_end
+                self.start, self.end = self.calc_boundaries(
+                    self.start, self.end, self.rank, self.num_ranks
+                )
                 logger.debug(
                     f"Using fixed rank.  Current rank: {self.rank} World size: {self.num_ranks}"
                 )
@@ -85,25 +74,26 @@ class DeltaIterableDataset(IterableDataset):
         elif torch.distributed.is_initialized():
             self.num_ranks = torch.distributed.get_world_size()
             self.rank = torch.distributed.get_rank()
+            logger.debug(
+                f"Detected DDP process. Current rank: {self.rank} World size: {self.num_ranks}"
+            )
             if init_start_end:
-                logger.debug(
-                    f"Detected DDP process. Current rank: {self.rank} World size: {self.num_ranks}"
+                self.start, self.end = self.calc_boundaries(
+                    self.start, self.end, self.rank, self.num_ranks
                 )
-                new_start = self.rank * self.end / self.num_ranks
-                new_end = (self.rank + 1) * self.end / self.num_ranks
                 logger.debug(
-                    "This rank will use the following set of rows: {self.start}-{self.end}"
+                    f"This rank will use the following set of rows: {self.start}-{self.end}"
                 )
-                self.start = new_start
-                self.end = new_end
         else:
             self.num_ranks = 1
             self.rank = 1
-        self.boundaries_set = True
 
-    @abstractmethod
-    def stop(self):
-        pass
+    @staticmethod
+    def calc_boundaries(start, end, rank, num_ranks):
+        per_worker_data_count = int(math.ceil((end - start) / float(num_ranks)))
+        new_start = start + rank * per_worker_data_count
+        new_end = min(start + (rank + 1) * per_worker_data_count, end)
+        return new_start, new_end
 
     @staticmethod
     def decode_and_transform_record(
@@ -129,22 +119,16 @@ class DeltaIterableDataset(IterableDataset):
         return _add_actions["num_records"].sum()
 
     def __iter__(self):
-        if self.loaded:
-            self.stop()
-        self.init_loading(self.path)
-        i = 0
-        while True:
-            try:
-                item = self.queue.get(block=True, timeout=self.timeout)
-                yield item
-                i += 1
-                # if i >= self.end:
-                #    return
-            except Empty:
-                print("empty ", i)
-                return
+        return self.process_data()
 
     def __len__(self):
-        if not self.boundaries_set:
-            self.init_boundaries(self.path)
+        # if self.drop_last:
+        #     per_machine_length = int(self.end - self.start)
+        #     per_worker_length = int(per_machine_length / self.num_workers)
+        #     number_of_batches_per_worker = per_worker_length // self.batch_size
+        #     batch_size_adjusted_per_machine_length = (
+        #         number_of_batches_per_worker * self.batch_size * self.num_workers
+        #     )
+        #     return batch_size_adjusted_per_machine_length
+        # else:
         return int(self.end - self.start)
